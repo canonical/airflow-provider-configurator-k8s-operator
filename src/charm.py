@@ -328,23 +328,36 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         return ops.ActiveStatus()
 
     def _on_secret_changed(self, event: ops.SecretChangedEvent) -> None:
-        """Reconcile, forcing the publish past the content-hash dedup.
+        """Reconcile; force the publish only for the configured sensitive secret.
 
         A new revision of the user secret can carry different sensitive values
         under exactly the same options, which leaves the config hash identical
         (see _config_hash for why the values are not part of it). This event is
         the only indication that those values moved, so it must not be deduped
         away or the coordinator would keep rendering the superseded revision.
+
+        secret-changed also fires for the git relation's credential secrets. A
+        PAT/SSH-key rotation never changes what is published, and the git lib
+        already reconciles it via git_connection_information_updated, so it goes
+        through the normal dedup instead of forcing a republish.
+
+        ``rotate_sensitive_provider_secret`` marks the point where this charm has
+        published the new revision's values to every coordinator relation. It does
+        not mean the coordinator has re-rendered them or that Airflow components
+        have restarted with them; those happen asynchronously in other charms and
+        are not observable from here.
         """
-        failure = self._reconcile(event, force_publish=True)
-        # secret-changed also fires for the git relation's credential secrets;
-        # only the configured sensitive secret is a provider-secret rotation.
-        if failure is None and self._is_sensitive_secret(event.secret):
+        is_sensitive = self._is_sensitive_secret(event.secret)
+        failure = self._reconcile(event, force_publish=is_sensitive)
+        # A converged reconcile alone is not proof of publication: set_configuration
+        # is a no-op on non-leaders and without a coordinator relation.
+        if failure is None and is_sensitive and self._config_provider.is_published():
             self._security_events.log_configuration_change(
                 "rotate_sensitive_provider_secret",
                 {
                     "secret_config": CONFIG_SENSITIVE_SECRET,
                     "observed_via": "juju_secret_changed",
+                    "propagation": "published_to_coordinator_relation",
                 },
             )
 
@@ -506,8 +519,8 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         Args:
             force: when True, bypass the content-hash deduplication and always
                 (re)publish the current configuration. Used by the sync-now
-                action so an operator can force a republish on demand even when
-                the content is unchanged.
+                action, and by secret-changed for the configured sensitive
+                secret, whose values can change without changing the hash.
 
         Raises:
             ExitWithStatusError: if the file is missing or cannot be parsed as
